@@ -254,10 +254,22 @@ class deconv(nn.Module):
 
 
 class InpaintGenerator(BaseNetwork):
-    def __init__(self, init_weights=True, model_path=None):
+    def __init__(self, init_weights=True, model_path=None, encoder_chunk_size=None, defrag_threshold_mb=None):
         super(InpaintGenerator, self).__init__()
         channel = 128
         hidden = 512
+        # Number of frames to run through the per-frame-independent parts of
+        # this model at a time: the encoder, SoftSplit/SoftComp (the single
+        # largest transient tensors in this model -- each token's raw
+        # unfolded representation is ~12x larger than its embedded form),
+        # and the decoder. None of these mix information across frames
+        # (confirmed by inspection: only `self.transformers`, run in
+        # between ss and sc, does that), so chunking them is a pure
+        # memory/compute-scheduling change with bit-exact output -- unlike
+        # shrinking the transformer's frame window, which trades temporal
+        # context for memory. None (default) preserves the original
+        # unchunked behavior exactly.
+        self.encoder_chunk_size = encoder_chunk_size
 
         # encoder
         self.encoder = Encoder()
@@ -299,7 +311,8 @@ class InpaintGenerator(BaseNetwork):
                                                 window_size=window_size,
                                                 pool_size=pool_size,
                                                 depths=depths,
-                                                t2t_params=t2t_params)
+                                                t2t_params=t2t_params,
+                                                defrag_threshold_mb=defrag_threshold_mb)
         if init_weights:
             self.init_weights()
 
@@ -327,9 +340,19 @@ class InpaintGenerator(BaseNetwork):
         b, t, _, ori_h, ori_w = masked_frames.size()
 
         # extracting features
-        enc_feat = self.encoder(torch.cat([masked_frames.view(b * t, 3, ori_h, ori_w),
-                                        masks_in.view(b * t, 1, ori_h, ori_w),
-                                        masks_updated.view(b * t, 1, ori_h, ori_w)], dim=1))
+        enc_input = torch.cat([masked_frames.view(b * t, 3, ori_h, ori_w),
+                                masks_in.view(b * t, 1, ori_h, ori_w),
+                                masks_updated.view(b * t, 1, ori_h, ori_w)], dim=1)
+        chunk_size = self.encoder_chunk_size
+        if chunk_size is None or chunk_size >= b * t:
+            enc_feat = self.encoder(enc_input)
+        else:
+            enc_feat_chunks = []
+            for i in range(0, b * t, chunk_size):
+                enc_feat_chunks.append(self.encoder(enc_input[i:i + chunk_size]))
+            enc_feat = torch.cat(enc_feat_chunks, dim=0)
+            del enc_feat_chunks
+        del enc_input
         _, c, h, w = enc_feat.size()
         local_feat = enc_feat.view(b, t, c, h, w)[:, :l_t, ...]
         ref_feat = enc_feat.view(b, t, c, h, w)[:, l_t:, ...]
@@ -354,10 +377,10 @@ class InpaintGenerator(BaseNetwork):
         _, _, local_feat, _ = self.feat_prop_module(local_feat, ds_flows_f, ds_flows_b, prop_mask_in, interpolation)
         enc_feat = torch.cat((local_feat, ref_feat), dim=1)
 
-        trans_feat = self.ss(enc_feat.view(-1, c, h, w), b, fold_feat_size)
+        trans_feat = self.ss(enc_feat.view(-1, c, h, w), b, fold_feat_size, chunk_size=self.encoder_chunk_size)
         mask_pool_l = rearrange(mask_pool_l, 'b t c h w -> b t h w c').contiguous()
         trans_feat = self.transformers(trans_feat, fold_feat_size, mask_pool_l, t_dilation=t_dilation)
-        trans_feat = self.sc(trans_feat, t, fold_feat_size)
+        trans_feat = self.sc(trans_feat, t, fold_feat_size, chunk_size=self.encoder_chunk_size)
         trans_feat = trans_feat.view(b, t, -1, h, w)
 
         enc_feat = enc_feat + trans_feat
@@ -366,7 +389,16 @@ class InpaintGenerator(BaseNetwork):
             output = self.decoder(enc_feat.view(-1, c, h, w))
             output = torch.tanh(output).view(b, t, 3, ori_h, ori_w)
         else:
-            output = self.decoder(enc_feat[:, :l_t].view(-1, c, h, w))
+            decoder_input = enc_feat[:, :l_t].view(-1, c, h, w)
+            chunk_size = self.encoder_chunk_size
+            if chunk_size is None or chunk_size >= decoder_input.size(0):
+                output = self.decoder(decoder_input)
+            else:
+                output_chunks = []
+                for i in range(0, decoder_input.size(0), chunk_size):
+                    output_chunks.append(self.decoder(decoder_input[i:i + chunk_size]))
+                output = torch.cat(output_chunks, dim=0)
+                del output_chunks
             output = torch.tanh(output).view(b, l_t, 3, ori_h, ori_w)
 
         return output

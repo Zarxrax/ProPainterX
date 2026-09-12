@@ -9,7 +9,11 @@ from .corr import CorrBlock, AlternateCorrBlock
 from .utils.utils import bilinear_sampler, coords_grid, upflow8
 
 try:
-    autocast = torch.cuda.amp.autocast
+    # torch>=2.0: non-deprecated replacement for torch.cuda.amp.autocast.
+    # Kept CUDA-only to match the original behavior exactly (this class is
+    # only ever invoked with the module already placed on a CUDA device).
+    def autocast(enabled):
+        return torch.amp.autocast('cuda', enabled=enabled)
 except:
     # dummy autocast for PyTorch < 1.6
     class autocast:

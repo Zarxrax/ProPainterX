@@ -16,16 +16,31 @@ class SoftSplit(nn.Module):
         c_in = reduce((lambda x, y: x * y), kernel_size) * channel
         self.embedding = nn.Linear(c_in, hidden)
 
-    def forward(self, x, b, output_size):
+    def forward(self, x, b, output_size, chunk_size=None):
         f_h = int((output_size[0] + 2 * self.padding[0] -
                    (self.kernel_size[0] - 1) - 1) / self.stride[0] + 1)
         f_w = int((output_size[1] + 2 * self.padding[1] -
                    (self.kernel_size[1] - 1) - 1) / self.stride[1] + 1)
 
-        feat = self.t2t(x)
-        feat = feat.permute(0, 2, 1)
-        # feat shape [b*t, num_vec, ks*ks*c]
-        feat = self.embedding(feat)
+        # x is (b*t, c, h, w): unfold+embed is fully independent per item on
+        # this leading dim (no cross-frame or cross-batch mixing), so this
+        # can be chunked over it with bit-exact output regardless of
+        # chunk_size -- the raw unfold tensor this produces is ~12x larger
+        # than its embedded (hidden-dim) output, making it one of the
+        # single largest transient tensors in the whole model.
+        if chunk_size is None or chunk_size >= x.size(0):
+            feat = self.t2t(x)
+            feat = feat.permute(0, 2, 1)
+            # feat shape [b*t, num_vec, ks*ks*c]
+            feat = self.embedding(feat)
+        else:
+            feat_chunks = []
+            for i in range(0, x.size(0), chunk_size):
+                sub = self.t2t(x[i:i + chunk_size])
+                sub = sub.permute(0, 2, 1)
+                feat_chunks.append(self.embedding(sub))
+            feat = torch.cat(feat_chunks, dim=0)
+            del feat_chunks
         # feat shape after embedding [b, t*num_vec, hidden]
         feat = feat.view(b, -1, f_h, f_w, feat.size(2))
         return feat
@@ -46,7 +61,7 @@ class SoftComp(nn.Module):
                                    stride=1,
                                    padding=1)
 
-    def forward(self, x, t, output_size):
+    def _forward_one(self, x, t, output_size):
         b_, _, _, _, c_ = x.shape
         x = x.view(b_, -1, c_)
         feat = self.embedding(x)
@@ -58,6 +73,24 @@ class SoftComp(nn.Module):
                       stride=self.stride,
                       padding=self.padding)
         feat = self.bias_conv(feat)
+        return feat
+
+    def forward(self, x, t, output_size, chunk_size=None):
+        # x is (b_, t, f_h, f_w, c_): embed+fold is independent per frame,
+        # same reasoning as SoftSplit above, EXCEPT the internal reshape
+        # here assumes each batch item's frames are laid out contiguously,
+        # so this chunked path is only used when b_==1 (always true in
+        # this pipeline, which processes one video at a time) -- falls
+        # back to the original one-shot computation otherwise.
+        b_ = x.size(0)
+        if chunk_size is None or chunk_size >= t or b_ != 1:
+            return self._forward_one(x, t, output_size)
+        feat_chunks = []
+        for i in range(0, t, chunk_size):
+            sub_x = x[:, i:i + chunk_size]
+            feat_chunks.append(self._forward_one(sub_x, sub_x.size(1), output_size))
+        feat = torch.cat(feat_chunks, dim=0)
+        del feat_chunks
         return feat
 
 
@@ -177,34 +210,16 @@ class SparseWindowAttention(nn.Module):
         win_q = window_partition(q.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
         win_k = window_partition(k.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
         win_v = window_partition(v.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
-        # roll_k and roll_v
-        if any(i > 0 for i in self.expand_size):
-            (k_tl, v_tl) = map(lambda a: torch.roll(a, shifts=(-self.expand_size[0], -self.expand_size[1]), dims=(2, 3)), (k, v))
-            (k_tr, v_tr) = map(lambda a: torch.roll(a, shifts=(-self.expand_size[0], self.expand_size[1]), dims=(2, 3)), (k, v))
-            (k_bl, v_bl) = map(lambda a: torch.roll(a, shifts=(self.expand_size[0], -self.expand_size[1]), dims=(2, 3)), (k, v))
-            (k_br, v_br) = map(lambda a: torch.roll(a, shifts=(self.expand_size[0], self.expand_size[1]), dims=(2, 3)), (k, v))
+        del q
 
-            (k_tl_windows, k_tr_windows, k_bl_windows, k_br_windows) = map(
-                lambda a: window_partition(a, self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head), 
-                (k_tl, k_tr, k_bl, k_br))
-            (v_tl_windows, v_tr_windows, v_bl_windows, v_br_windows) = map(
-                lambda a: window_partition(a, self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head), 
-                (v_tl, v_tr, v_bl, v_br))
-            rool_k = torch.cat((k_tl_windows, k_tr_windows, k_bl_windows, k_br_windows), 4).contiguous()
-            rool_v = torch.cat((v_tl_windows, v_tr_windows, v_bl_windows, v_br_windows), 4).contiguous() # [b, n_wh*n_ww, n_head, t, w_h*w_w, c_head]
-            # mask out tokens in current window
-            rool_k = rool_k[:, :, :, :, self.valid_ind_rolled]
-            rool_v = rool_v[:, :, :, :, self.valid_ind_rolled]
-            roll_N = rool_k.shape[4]
-            rool_k = rool_k.view(b, n_wh*n_ww, self.n_head, t, roll_N, c // self.n_head)
-            rool_v = rool_v.view(b, n_wh*n_ww, self.n_head, t, roll_N, c // self.n_head)
-            win_k = torch.cat((win_k, rool_k), dim=4)
-            win_v = torch.cat((win_v, rool_v), dim=4)
-        else:
-            win_k = win_k
-            win_v = win_v
-        
-        # pool_k and pool_v
+        # pool_k and pool_v -- computed here (moved ahead of the roll section
+        # below) since this only depends on `x`, not on anything the roll
+        # section produces. This lets `x` -- a full (b,t,h,w,c) tensor -- be
+        # freed before the roll section starts instead of staying alive
+        # for the rest of the method. The final concatenation order into
+        # win_k/win_v (base, then rolled, then pooled) is unchanged, so
+        # this is bit-exact with the original -- purely a reordering of
+        # *when* things are computed and freed, not *what* is computed.
         if self.pooling_token:
             pool_x = self.pool_layer(x.view(b*t, new_h, new_w, c).permute(0,3,1,2))
             _, _, p_h, p_w = pool_x.shape
@@ -213,12 +228,67 @@ class SparseWindowAttention(nn.Module):
             pool_k = self.key(pool_x).unsqueeze(1).repeat(1, n_wh*n_ww, 1, 1, 1, 1) # [b, n_wh*n_ww, t, p_h, p_w, c]
             pool_k = pool_k.view(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
             pool_k = pool_k.contiguous().view(b, n_wh*n_ww, self.n_head, t, p_h*p_w, c_head)
-            win_k = torch.cat((win_k, pool_k), dim=4)
             # pool_v
             pool_v = self.value(pool_x).unsqueeze(1).repeat(1, n_wh*n_ww, 1, 1, 1, 1) # [b, n_wh*n_ww, t, p_h, p_w, c]
             pool_v = pool_v.view(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
             pool_v = pool_v.contiguous().view(b, n_wh*n_ww, self.n_head, t, p_h*p_w, c_head)
+            del pool_x
+        del x
+
+        # roll_k and roll_v
+        if any(i > 0 for i in self.expand_size):
+            # Process one of the four (top-left/top-right/bottom-left/
+            # bottom-right) directions at a time, instead of materializing
+            # all four full-size (b,t,h,w,c) rolled copies of k AND v
+            # simultaneously (8 full-size tensors alive at once in the
+            # original code, on top of k, v, and x themselves). Each
+            # rolled tensor is windowed immediately and discarded before
+            # the next direction starts, so at most one rolled-k and one
+            # rolled-v (much smaller once windowed) are alive together.
+            # Bit-exact: identical operations in the identical order, only
+            # the memory lifetime of each intermediate changes.
+            shifts = (
+                (-self.expand_size[0], -self.expand_size[1]),  # top-left
+                (-self.expand_size[0], self.expand_size[1]),   # top-right
+                (self.expand_size[0], -self.expand_size[1]),   # bottom-left
+                (self.expand_size[0], self.expand_size[1]),    # bottom-right
+            )
+            k_windows_list = []
+            v_windows_list = []
+            for shift in shifts:
+                k_rolled = torch.roll(k, shifts=shift, dims=(2, 3))
+                k_windows_list.append(
+                    window_partition(k_rolled, self.window_size, self.n_head).view(
+                        b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head))
+                del k_rolled
+                v_rolled = torch.roll(v, shifts=shift, dims=(2, 3))
+                v_windows_list.append(
+                    window_partition(v_rolled, self.window_size, self.n_head).view(
+                        b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head))
+                del v_rolled
+
+            rool_k = torch.cat(k_windows_list, 4).contiguous()
+            rool_v = torch.cat(v_windows_list, 4).contiguous() # [b, n_wh*n_ww, n_head, t, w_h*w_w, c_head]
+            del k_windows_list, v_windows_list
+            # mask out tokens in current window
+            rool_k = rool_k[:, :, :, :, self.valid_ind_rolled]
+            rool_v = rool_v[:, :, :, :, self.valid_ind_rolled]
+            roll_N = rool_k.shape[4]
+            rool_k = rool_k.view(b, n_wh*n_ww, self.n_head, t, roll_N, c // self.n_head)
+            rool_v = rool_v.view(b, n_wh*n_ww, self.n_head, t, roll_N, c // self.n_head)
+            win_k = torch.cat((win_k, rool_k), dim=4)
+            win_v = torch.cat((win_v, rool_v), dim=4)
+            del rool_k, rool_v
+        else:
+            win_k = win_k
+            win_v = win_v
+        del k, v
+
+        # pool_k and pool_v
+        if self.pooling_token:
+            win_k = torch.cat((win_k, pool_k), dim=4)
             win_v = torch.cat((win_v, pool_v), dim=4)
+            del pool_k, pool_v
 
         # [b, n_wh*n_ww, n_head, t, w_h*w_w, c_head]
         out = torch.zeros_like(win_q)
@@ -315,7 +385,7 @@ class TemporalSparseTransformer(nn.Module):
 
 
 class TemporalSparseTransformerBlock(nn.Module):
-    def __init__(self, dim, n_head, window_size, pool_size, depths, t2t_params=None):
+    def __init__(self, dim, n_head, window_size, pool_size, depths, t2t_params=None, defrag_threshold_mb=None):
         super().__init__()
         blocks = []
         for i in range(depths):
@@ -324,6 +394,21 @@ class TemporalSparseTransformerBlock(nn.Module):
              )
         self.transformer = nn.Sequential(*blocks)
         self.depths = depths
+        # If set, after each of the `depths` sequential transformer layers,
+        # check whether PyTorch's caching allocator is holding significantly
+        # more memory "reserved" (claimed from the driver, visible in
+        # nvidia-smi) than currently "allocated" (actively used by a live
+        # tensor) -- a sign of fragmentation from the repeated alloc/free
+        # cycles inside each layer's windowed attention -- and proactively
+        # defragment via torch.cuda.empty_cache() when the gap exceeds this
+        # threshold. There is normally no cache-clearing between these 8
+        # sequential layers (the pipeline only clears between much coarser
+        # stages), so a gap here can only be found and fixed at this level.
+        # Off by default: reading memory_reserved()/memory_allocated() is
+        # cheap, but torch.cuda.empty_cache() itself is a synchronizing
+        # call with a real speed cost, so this is opt-in for when you are
+        # VRAM-constrained enough to trade some speed for a lower peak.
+        self.defrag_threshold_mb = defrag_threshold_mb
 
     def forward(self, x, fold_x_size, l_mask=None, t_dilation=2):
         """
@@ -340,5 +425,10 @@ class TemporalSparseTransformerBlock(nn.Module):
 
         for i in range(0, self.depths):
             x = self.transformer[i](x, fold_x_size, l_mask, T_ind[i])
+            if self.defrag_threshold_mb is not None and x.is_cuda:
+                device = x.device
+                gap_mb = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**2
+                if gap_mb > self.defrag_threshold_mb:
+                    torch.cuda.empty_cache()
 
         return x

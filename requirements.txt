@@ -14,3 +14,4 @@ pyyaml
 requests
 timm
 yapf
+huggingface_hub

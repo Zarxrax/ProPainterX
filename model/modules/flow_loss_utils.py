@@ -28,7 +28,7 @@ def flow_warp(x,
     _, _, h, w = x.size()
     # create mesh grid
     device = flow.device
-    grid_y, grid_x = torch.meshgrid(torch.arange(0, h, device=device), torch.arange(0, w, device=device))
+    grid_y, grid_x = torch.meshgrid(torch.arange(0, h, device=device), torch.arange(0, w, device=device), indexing='ij')
     grid = torch.stack((grid_x, grid_y), 2).type_as(x)  # (w, h, 2)
     grid.requires_grad = False
 
