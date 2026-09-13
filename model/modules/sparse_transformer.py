@@ -4,6 +4,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def fuse_qkv_state_dict(state_dict):
+    """
+    Remap a checkpoint saved from the original SparseWindowAttention (separate
+    `query`/`key`/`value` Linear layers) onto the fused single-`qkv`-Linear
+    layout used here now. This is purely a reorganization of the same trained
+    weights -- concatenating the existing query/key/value weight and bias
+    tensors along the output dimension, in the same order `SparseWindowAttention.
+    forward` splits them back apart (`qkv.chunk(3, dim=-1)` expects
+    [query_features, key_features, value_features]) -- so it produces
+    bit-exact results versus the original three-linear-layer computation.
+    Returns a new dict; does not mutate the one passed in. Keys that don't
+    match the old query/key/value pattern (e.g. everything outside
+    SparseWindowAttention) are passed through untouched.
+    """
+    state_dict = dict(state_dict)
+    query_keys = [k for k in state_dict if k.endswith('.query.weight')]
+    for qk in query_keys:
+        prefix = qk[: -len('.query.weight')]
+        kk, vk = f'{prefix}.key.weight', f'{prefix}.value.weight'
+        qb, kb, vb = f'{prefix}.query.bias', f'{prefix}.key.bias', f'{prefix}.value.bias'
+        if kk not in state_dict or vk not in state_dict:
+            continue  # not actually a query/key/value attention triple
+        state_dict[f'{prefix}.qkv.weight'] = torch.cat(
+            [state_dict.pop(qk), state_dict.pop(kk), state_dict.pop(vk)], dim=0)
+        if qb in state_dict and kb in state_dict and vb in state_dict:
+            state_dict[f'{prefix}.qkv.bias'] = torch.cat(
+                [state_dict.pop(qb), state_dict.pop(kb), state_dict.pop(vb)], dim=0)
+    return state_dict
+
 class SoftSplit(nn.Module):
     def __init__(self, channel, hidden, kernel_size, stride, padding):
         super(SoftSplit, self).__init__()
@@ -103,6 +133,33 @@ class FusionFeedForward(nn.Module):
         assert t2t_params is not None
         self.t2t_params = t2t_params
         self.kernel_shape = reduce((lambda x, y: x * y), t2t_params['kernel_size']) # 49
+        # The fold "normalizer" computed in forward() below depends only on
+        # (b, n_vecs, output_size, dtype, device) -- never on the actual
+        # feature values -- yet this module runs once per transformer depth
+        # (8x per model() call) with the exact same shape every single time
+        # within a run (same b=1, same output_size, same frame count per
+        # window). Recomputing an all-ones fold from scratch 8x per call is
+        # pure waste, so it's cached here keyed by the values it actually
+        # depends on. Bit-exact: identical computation, just done once and
+        # reused instead of repeated.
+        self._normalizer_cache = {}
+
+    def _get_normalizer(self, b_fold, n_vecs, output_size, dtype, device):
+        # b_fold is the effective fold batch size (original code reshapes
+        # (b, n, kernel_shape) to (-1, n_vecs, kernel_shape) before folding,
+        # i.e. b_fold = b * n // n_vecs -- one "batch" item per frame, since
+        # n = T * n_vecs when x holds T frames' worth of tokens).
+        key = (b_fold, n_vecs, output_size, dtype, device)
+        normalizer = self._normalizer_cache.get(key)
+        if normalizer is None:
+            ones = torch.ones(b_fold, n_vecs, self.kernel_shape, dtype=dtype, device=device)
+            normalizer = F.fold(ones.permute(0, 2, 1),
+                                output_size=output_size,
+                                kernel_size=self.t2t_params['kernel_size'],
+                                padding=self.t2t_params['padding'],
+                                stride=self.t2t_params['stride'])
+            self._normalizer_cache[key] = normalizer
+        return normalizer
 
     def forward(self, x, output_size):
         n_vecs = 1
@@ -112,12 +169,7 @@ class FusionFeedForward(nn.Module):
 
         x = self.fc1(x)
         b, n, c = x.size()
-        normalizer = x.new_ones(b, n, self.kernel_shape).view(-1, n_vecs, self.kernel_shape).permute(0, 2, 1)
-        normalizer = F.fold(normalizer,
-                            output_size=output_size,
-                            kernel_size=self.t2t_params['kernel_size'],
-                            padding=self.t2t_params['padding'],
-                            stride=self.t2t_params['stride'])
+        normalizer = self._get_normalizer(b * n // n_vecs, n_vecs, output_size, x.dtype, x.device)
 
         x = F.fold(x.view(-1, n_vecs, c).permute(0, 2, 1),
                    output_size=output_size,
@@ -152,10 +204,18 @@ class SparseWindowAttention(nn.Module):
                 pooling_token=True):
         super().__init__()
         assert dim % n_head == 0
-        # key, query, value projections for all heads
-        self.key = nn.Linear(dim, dim, qkv_bias)
-        self.query = nn.Linear(dim, dim, qkv_bias)
-        self.value = nn.Linear(dim, dim, qkv_bias)
+        self.dim = dim
+        # Fused query/key/value projection: one Linear(dim, 3*dim) instead of
+        # three separate Linear(dim, dim) calls. Mathematically identical to
+        # three separate projections (the weights are just concatenated along
+        # the output dimension) but issues one larger matmul instead of three
+        # smaller ones, which GPUs generally execute more efficiently. Output
+        # of self.qkv(x) is ordered [query_features, key_features,
+        # value_features] along the last dim so `.chunk(3, dim=-1)` recovers
+        # q, k, v in that order. A checkpoint trained with the original
+        # separate query/key/value layers is remapped onto this layout by
+        # `fuse_qkv_state_dict` (see below) before loading.
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         # regularization
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -204,9 +264,9 @@ class SparseWindowAttention(nn.Module):
             mask = F.pad(mask,(0, 0, 0, pad_r, 0, pad_b, 0, 0), mode='constant', value=0) 
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
+        qkv = self.qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        del qkv
         win_q = window_partition(q.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
         win_k = window_partition(k.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
         win_v = window_partition(v.contiguous(), self.window_size, self.n_head).view(b, n_wh*n_ww, self.n_head, t, w_h*w_w, c_head)
@@ -224,13 +284,30 @@ class SparseWindowAttention(nn.Module):
             pool_x = self.pool_layer(x.view(b*t, new_h, new_w, c).permute(0,3,1,2))
             _, _, p_h, p_w = pool_x.shape
             pool_x = pool_x.permute(0,2,3,1).view(b, t, p_h, p_w, c)
-            # pool_k
-            pool_k = self.key(pool_x).unsqueeze(1).repeat(1, n_wh*n_ww, 1, 1, 1, 1) # [b, n_wh*n_ww, t, p_h, p_w, c]
-            pool_k = pool_k.view(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
+            # Only key/value are needed for the pooled tokens (they're never
+            # used as queries), so slice the fused qkv weight/bias down to
+            # just the key+value rows instead of running the full qkv
+            # projection (which would waste compute producing an unused
+            # pooled query) or calling two separate linears. Bit-exact with
+            # calling self.key(pool_x) and self.value(pool_x) separately,
+            # since those are literally the same weight rows.
+            kv_weight = self.qkv.weight[self.dim:]
+            kv_bias = self.qkv.bias[self.dim:] if self.qkv.bias is not None else None
+            pool_kv = F.linear(pool_x, kv_weight, kv_bias)
+            pool_k, pool_v = pool_kv.chunk(2, dim=-1)
+            del pool_kv
+            # broadcast (not copy) across windows: every window uses the same
+            # pooled global tokens, so `.expand()` here is a zero-cost view
+            # instead of `.repeat()`'s immediate n_wh*n_ww-fold physical copy.
+            # The `.contiguous()` calls below still materialize the final
+            # layout exactly once (unavoidable given the reshape), but this
+            # way there is only ever one physical copy in memory instead of
+            # two (repeat's copy, then contiguous's copy).
+            pool_k = pool_k.unsqueeze(1).expand(-1, n_wh*n_ww, -1, -1, -1, -1) # [b, n_wh*n_ww, t, p_h, p_w, c]
+            pool_k = pool_k.reshape(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
             pool_k = pool_k.contiguous().view(b, n_wh*n_ww, self.n_head, t, p_h*p_w, c_head)
-            # pool_v
-            pool_v = self.value(pool_x).unsqueeze(1).repeat(1, n_wh*n_ww, 1, 1, 1, 1) # [b, n_wh*n_ww, t, p_h, p_w, c]
-            pool_v = pool_v.view(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
+            pool_v = pool_v.unsqueeze(1).expand(-1, n_wh*n_ww, -1, -1, -1, -1) # [b, n_wh*n_ww, t, p_h, p_w, c]
+            pool_v = pool_v.reshape(b, n_wh*n_ww, t, p_h, p_w, self.n_head, c_head).permute(0,1,5,2,3,4,6)
             pool_v = pool_v.contiguous().view(b, n_wh*n_ww, self.n_head, t, p_h*p_w, c_head)
             del pool_x
         del x
@@ -317,11 +394,18 @@ class SparseWindowAttention(nn.Module):
                     win_k_t = win_k_t.view(n_wh*n_ww, self.n_head, t*w_h*w_w, c_head)
                     win_v_t = win_v_t.view(n_wh*n_ww, self.n_head, t*w_h*w_w, c_head)
 
-                att_t = (win_q_t @ win_k_t.transpose(-2, -1)) * (1.0 / math.sqrt(win_q_t.size(-1)))
-                att_t = F.softmax(att_t, dim=-1)
-                att_t = self.attn_drop(att_t)
-                y_t = att_t @ win_v_t 
-                
+                # Fused scaled-dot-product-attention kernel (flash-attention /
+                # memory-efficient-attention on CUDA) instead of materializing
+                # the full [.., seq, seq] attention matrix by hand. q/k/v are
+                # already in the [batch, heads, seq, head_dim] layout SDPA
+                # expects, and there's no additional mask to apply here (the
+                # masked/unmasked key-value sets were already selected above),
+                # so this is a direct drop-in. Not bit-exact vs. the manual
+                # matmul+softmax+matmul (different kernel/summation order)
+                # but numerically equivalent; attn_drop is 0 at inference so
+                # dropout_p=0 here matches the (disabled) self.attn_drop.
+                y_t = F.scaled_dot_product_attention(win_q_t, win_k_t, win_v_t)
+
                 out[i, mask_ind_i] = y_t.view(-1, self.n_head, t, w_h*w_w, c_head)
 
             ### For unmasked windows
@@ -332,10 +416,12 @@ class SparseWindowAttention(nn.Module):
             win_k_s = win_k[i, unmask_ind_i, :, :, :w_h*w_w]
             win_v_s = win_v[i, unmask_ind_i, :, :, :w_h*w_w]
 
-            att_s = (win_q_s @ win_k_s.transpose(-2, -1)) * (1.0 / math.sqrt(win_q_s.size(-1)))
-            att_s = F.softmax(att_s, dim=-1)
-            att_s = self.attn_drop(att_s)
-            y_s = att_s @ win_v_s
+            # Same fused-kernel swap as the masked branch above. SDPA treats
+            # every dim except the last two (sequence, head_dim) as batch, so
+            # it works directly on these 5D (unmask_n, n_head, t, w_h*w_w,
+            # c_head) tensors -- attention stays independent per-t here, same
+            # as the original per-t broadcasted matmul.
+            y_s = F.scaled_dot_product_attention(win_q_s, win_k_s, win_v_s)
             out[i, unmask_ind_i] = y_s
 
         # re-assemble all head outputs side by side
@@ -385,7 +471,7 @@ class TemporalSparseTransformer(nn.Module):
 
 
 class TemporalSparseTransformerBlock(nn.Module):
-    def __init__(self, dim, n_head, window_size, pool_size, depths, t2t_params=None, defrag_threshold_mb=None):
+    def __init__(self, dim, n_head, window_size, pool_size, depths, t2t_params=None):
         super().__init__()
         blocks = []
         for i in range(depths):
@@ -394,21 +480,6 @@ class TemporalSparseTransformerBlock(nn.Module):
              )
         self.transformer = nn.Sequential(*blocks)
         self.depths = depths
-        # If set, after each of the `depths` sequential transformer layers,
-        # check whether PyTorch's caching allocator is holding significantly
-        # more memory "reserved" (claimed from the driver, visible in
-        # nvidia-smi) than currently "allocated" (actively used by a live
-        # tensor) -- a sign of fragmentation from the repeated alloc/free
-        # cycles inside each layer's windowed attention -- and proactively
-        # defragment via torch.cuda.empty_cache() when the gap exceeds this
-        # threshold. There is normally no cache-clearing between these 8
-        # sequential layers (the pipeline only clears between much coarser
-        # stages), so a gap here can only be found and fixed at this level.
-        # Off by default: reading memory_reserved()/memory_allocated() is
-        # cheap, but torch.cuda.empty_cache() itself is a synchronizing
-        # call with a real speed cost, so this is opt-in for when you are
-        # VRAM-constrained enough to trade some speed for a lower peak.
-        self.defrag_threshold_mb = defrag_threshold_mb
 
     def forward(self, x, fold_x_size, l_mask=None, t_dilation=2):
         """
@@ -425,10 +496,5 @@ class TemporalSparseTransformerBlock(nn.Module):
 
         for i in range(0, self.depths):
             x = self.transformer[i](x, fold_x_size, l_mask, T_ind[i])
-            if self.defrag_threshold_mb is not None and x.is_cuda:
-                device = x.device
-                gap_mb = (torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / 1024**2
-                if gap_mb > self.defrag_threshold_mb:
-                    torch.cuda.empty_cache()
 
         return x

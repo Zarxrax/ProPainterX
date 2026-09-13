@@ -9,7 +9,7 @@ import torchvision
 from einops import rearrange
 
 from model.modules.base_module import BaseNetwork
-from model.modules.sparse_transformer import TemporalSparseTransformerBlock, SoftSplit, SoftComp
+from model.modules.sparse_transformer import TemporalSparseTransformerBlock, SoftSplit, SoftComp, fuse_qkv_state_dict
 from model.modules.spectral_norm import spectral_norm as _spectral_norm
 from model.modules.flow_loss_utils import flow_warp
 from model.modules.deformconv import ModulatedDeformConv2d
@@ -254,7 +254,7 @@ class deconv(nn.Module):
 
 
 class InpaintGenerator(BaseNetwork):
-    def __init__(self, init_weights=True, model_path=None, encoder_chunk_size=None, defrag_threshold_mb=None):
+    def __init__(self, init_weights=True, model_path=None, encoder_chunk_size=None):
         super(InpaintGenerator, self).__init__()
         channel = 128
         hidden = 512
@@ -311,8 +311,7 @@ class InpaintGenerator(BaseNetwork):
                                                 window_size=window_size,
                                                 pool_size=pool_size,
                                                 depths=depths,
-                                                t2t_params=t2t_params,
-                                                defrag_threshold_mb=defrag_threshold_mb)
+                                                t2t_params=t2t_params)
         if init_weights:
             self.init_weights()
 
@@ -320,6 +319,12 @@ class InpaintGenerator(BaseNetwork):
         if model_path is not None:
             print('Pretrained ProPainter has loaded...')
             ckpt = torch.load(model_path, map_location='cpu')
+            # Original checkpoints store separate query/key/value Linear
+            # weights per SparseWindowAttention; remap them onto this model's
+            # fused qkv Linear (see fuse_qkv_state_dict docstring) before
+            # loading. No-op if the checkpoint was already saved in the
+            # fused layout.
+            ckpt = fuse_qkv_state_dict(ckpt)
             self.load_state_dict(ckpt, strict=True)
 
         # print network parameter number

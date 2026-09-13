@@ -10,14 +10,17 @@ from .utils.utils import bilinear_sampler, coords_grid, upflow8
 
 try:
     # torch>=2.0: non-deprecated replacement for torch.cuda.amp.autocast.
-    # Kept CUDA-only to match the original behavior exactly (this class is
-    # only ever invoked with the module already placed on a CUDA device).
-    def autocast(enabled):
-        return torch.amp.autocast('cuda', enabled=enabled)
+    # device_type is taken from the tensor actually being processed rather
+    # than hardcoded, so this works (as a no-op when enabled=False, which is
+    # RAFT's usual setting -- see the "use fp32 for RAFT" note in
+    # flow_comp_raft.py) on CPU/MPS/whatever device the caller placed the
+    # model on, not just CUDA.
+    def autocast(device_type, enabled):
+        return torch.amp.autocast(device_type, enabled=enabled)
 except:
     # dummy autocast for PyTorch < 1.6
     class autocast:
-        def __init__(self, enabled):
+        def __init__(self, device_type, enabled):
             pass
         def __enter__(self):
             pass
@@ -101,7 +104,7 @@ class RAFT(nn.Module):
         cdim = self.context_dim
 
         # run the feature network
-        with autocast(enabled=self.args.mixed_precision):
+        with autocast(image1.device.type, enabled=self.args.mixed_precision):
             fmap1, fmap2 = self.fnet([image1, image2])
 
         fmap1 = fmap1.float()
@@ -113,7 +116,7 @@ class RAFT(nn.Module):
             corr_fn = CorrBlock(fmap1, fmap2, radius=self.args.corr_radius)
 
         # run the context network
-        with autocast(enabled=self.args.mixed_precision):
+        with autocast(image1.device.type, enabled=self.args.mixed_precision):
             cnet = self.cnet(image1)
             net, inp = torch.split(cnet, [hdim, cdim], dim=1)
             net = torch.tanh(net)
@@ -130,7 +133,7 @@ class RAFT(nn.Module):
             corr = corr_fn(coords1) # index correlation volume
 
             flow = coords1 - coords0
-            with autocast(enabled=self.args.mixed_precision):
+            with autocast(image1.device.type, enabled=self.args.mixed_precision):
                 net, up_mask, delta_flow = self.update_block(net, inp, corr, flow)
 
             # F(t+1) = F(t) + \Delta(t)

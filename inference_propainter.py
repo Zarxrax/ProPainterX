@@ -26,7 +26,6 @@ from model.modules.flow_comp_memfof import MEMFOF_bi
 from model.recurrent_flow_completion import RecurrentFlowCompleteNet
 from model.propainter import InpaintGenerator
 from utils.download_util import load_file_from_url
-from core.utils import to_tensors
 from model.misc import get_device
 
 import warnings
@@ -117,13 +116,29 @@ def resize_frames(frames, size=None):
     return frames, process_size, out_size
 
 
-def _read_video_pyav(filename):
-    """Decode a video file to a list of RGB uint8 HWC frames + fps.
+def pil_list_to_uint8_tensor(imgs, binarize=False):
+    """Stack a list of PIL Images into a uint8 CPU tensor (1, T, C, H, W).
 
-    Replaces torchvision.io.read_video, whose video decoding backend was
-    deprecated in torchvision 0.22 and removed in 0.24. Uses PyAV directly
-    (already a project dependency) instead of adding a new one (e.g. TorchCodec).
+    Frames/masks are kept as uint8 while CPU-resident to minimize RAM; each
+    chunk is converted to float only once it's on the active device (at each
+    call site that does `.to(device)`).
+
+    With binarize=True (for masks, which are always exactly 0 or 255), the
+    result is collapsed to {0, 1} directly, so callers needing a float mask
+    can just call .float() with no division, and callers needing a raw 0/1
+    uint8 mask can use it as-is.
     """
+    arr = np.stack([np.array(img) for img in imgs], axis=0)
+    if arr.ndim == 3:
+        arr = arr[..., None]  # add channel dim for single-channel (mask) images
+    t = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()  # (T, C, H, W), uint8
+    if binarize:
+        t = (t > 127).to(torch.uint8)
+    return t.unsqueeze(0)  # (1, T, C, H, W)
+
+
+def _read_video_pyav(filename):
+    """Decode a video file to a list of RGB uint8 HWC frames + fps, using PyAV."""
     container = av.open(filename)
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate is not None else 24.0
@@ -166,6 +181,12 @@ def read_mask(mpath, length, size, flow_mask_dilates=8, mask_dilates=5):
     
     if mpath.endswith(('jpg', 'jpeg', 'png', 'JPG', 'JPEG', 'PNG')): # input single img path
        masks_img = [Image.open(mpath)]
+    elif mpath.endswith(('mp4', 'mov', 'avi', 'MP4', 'MOV', 'AVI')): # input mask video path
+        mask_vframes, _ = _read_video_pyav(mpath)
+        masks_img = [Image.fromarray(f) for f in mask_vframes]
+        if len(masks_img) != length:
+            print(f'[mask] Warning: mask video has {len(masks_img)} frames, input video has '
+                  f'{length} -- these should match.')
     else:  
         mnames = sorted(os.listdir(mpath))
         for mp in mnames:
@@ -275,6 +296,20 @@ def _vram_peak_mb(device):
     return None  # no CUDA memory to report (e.g. running on CPU)
 
 
+def _vram_reserved_peak_mb(device):
+    """Peak of PyTorch's own caching-allocator pool (tensors *plus* whatever
+    cached-but-currently-unused blocks the allocator is holding onto for
+    reuse). Always >= _vram_peak_mb(). The gap between the two is
+    fragmentation/headroom PyTorch itself knows about; anything still
+    unexplained after that (true nvidia-smi peak minus this number) is
+    memory PyTorch has no visibility into at all -- typically cuDNN/cuBLAS
+    workspace buffers, allocated via direct cudaMalloc calls that bypass
+    the caching allocator entirely."""
+    if device.type == 'cuda':
+        return torch.cuda.max_memory_reserved(device) / 1024**2
+    return None
+
+
 class _GpuTruePeakPoller:
     """Background poller for the device's *true* memory usage (matches
     nvidia-smi exactly), sampled on a thread via pynvml.
@@ -360,7 +395,9 @@ if __name__ == '__main__':
     parser.add_argument(
         '-i', '--video', type=str, default='inputs/object_removal/bmx-trees', help='Path of the input video or image folder.')
     parser.add_argument(
-        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask', help='Path of the mask(s) or mask folder.')
+        '-m', '--mask', type=str, default='inputs/object_removal/bmx-trees_mask',
+        help='Path of the mask(s): a single image, a folder of per-frame mask images, or a video '
+             'file of binary mask frames (decoded the same way as --video).')
     parser.add_argument(
         '-o', '--output', type=str, default='results', help='Output folder. Default: results')
     parser.add_argument(
@@ -376,22 +413,35 @@ if __name__ == '__main__':
     parser.add_argument(
         "--neighbor_length", type=int, default=10, help='Length of local neighboring frames.')
     parser.add_argument(
-        "--subvideo_length", type=int, default=80, help='Length of sub-video for long video inference.')
+        "--subvideo_length", type=int, default=80,
+        help="Threshold (in frames) for when a video is considered 'long' enough to cap the "
+             "global reference-frame budget (see --max_ref_frames) instead of letting it grow "
+             "unbounded with video length. Also the default basis for --max_ref_frames and "
+             "--img_propagation_chunk_size when those are left unset.")
+    parser.add_argument(
+        '--max_ref_frames', type=int, default=None,
+        help="Maximum number of global reference frames sampled across the whole video, once "
+             "video_length exceeds --subvideo_length. A quality/algorithm parameter -- more "
+             "reference frames means more long-range temporal consistency, at the cost of more "
+             "compute. Left unset, defaults to --subvideo_length // --ref_stride.")
+    parser.add_argument(
+        '--img_propagation_chunk_size', type=int, default=80,
+        help="Number of frames Stage 3a (image propagation) processes per call. Raise for more "
+             "temporal context, lower for less VRAM. Not bit-exact regardless of size: image "
+             "propagation is a recurrent bidirectional pass (each frame's warped features depend "
+             "on the previous frame's), so a chunk boundary resets that context, softened only by "
+             "a padding overlap.")
     parser.add_argument(
         '--flow_completion_chunk_size', type=int, default=40,
-        help="Number of frames the flow-completion network processes per call. This used to "
-             "silently reuse --subvideo_length (=80 frames + 10 padding = ~90 at once by default), "
-             "far more than any other stage processes simultaneously, which is disproportionately "
-             "expensive here since the network keeps every frame's features live at once for its "
-             "bidirectional pass. NOTE: unlike RAFT/MemFOF's pairwise chunking or the encoder "
-             "chunking above, this is NOT guaranteed bit-exact regardless of size -- the recurrent "
-             "hidden state resets at each chunk boundary (softened by a few frames of padding "
-             "overlap), so a much smaller value trades a small amount of temporal context for "
-             "memory. Raise this if you have VRAM to spare and want maximum context.")
+        help="Number of frames the flow-completion network processes per call. Not guaranteed "
+             "bit-exact regardless of size, unlike RAFT/MemFOF's pairwise chunking or the encoder "
+             "chunking below: the recurrent hidden state resets at each chunk boundary (softened "
+             "by a few frames of padding overlap), so a smaller value trades some temporal context "
+             "for memory. Raise for more context, lower for less VRAM.")
     parser.add_argument(
         "--raft_iter", type=int, default=20, help='Iterations for RAFT inference.')
     parser.add_argument(
-        '--flow_model', default='raft', choices=['raft', 'memfof'],
+        '--flow_model', default='memfof', choices=['raft', 'memfof'],
         help="Optical flow model to use. 'raft' is the original ProPainter model. "
              "'memfof' (https://github.com/msu-video-group/memfof) is a more memory-efficient, "
              "multi-frame flow estimator built for native 1080p processing -- its all-pairs-free "
@@ -403,43 +453,18 @@ if __name__ == '__main__':
         help="HuggingFace Hub checkpoint to use when --flow_model=memfof. Default is the "
              "checkpoint MemFOF's authors recommend for real-world video.")
     parser.add_argument(
-        '--memfof_chunk_len', type=int, default=16,
-        help="Number of frames per chunk when --flow_model=memfof, replacing RAFT's much more "
-             "conservative resolution-based short_clip_len (RAFT needs that because of its "
-             "O((H*W)^2) all-pairs correlation volume; MemFOF uses a small local correlation "
-             "instead and doesn't have that problem). This is the main memory/speed lever for "
-             "Stage 1: larger values batch more windows per call (better GPU throughput, more "
-             "VRAM); if Stage 1's own VRAM usage in --vram_report is well below your other stages "
-             "there's likely room to raise it, but each step up costs real memory for modest speed "
-             "gains, so don't push further than you need. If you see it climb sharply or OOM, bring "
-             "it back down.")
-    parser.add_argument(
-        '--memfof_fmap_cache', action='store_true',
-        help="Enable MemFOF's feature-map caching across its sliding 3-frame window: each window "
-             "would reuse 2 of its 3 needed feature maps from the previous window instead of "
-             "recomputing them (~3x less redundant feature-extraction compute), but this requires "
-             "processing one window at a time (batch=1) instead of batching them all into one call "
-             "like the default path. MEASURED: this trades away far more GPU throughput than the "
-             "compute savings recover -- in testing, enabling this made Stage 1 SLOWER overall "
-             "despite doing less redundant work, because batch=1 severely underuses the GPU. VRAM "
-             "does drop substantially with this on, so it may still be worth it if you are VRAM-"
-             "desperate and can accept a real speed cost -- but it is off by default because for "
-             "most cases --memfof_chunk_len is the better lever for both memory and speed. Also not "
-             "proven bit-exact vs the default path -- measured small (likely negligible with real "
-             "trained weights, unverified) differences from batch-size-dependent floating-point "
-             "rounding amplified through the refinement iterations.")
+        '--memfof_chunk_len', type=int, default=8,
+        help="Number of frames per chunk when --flow_model=memfof. Larger values batch more "
+             "windows per call (better GPU throughput, more VRAM) -- the main memory/speed lever "
+             "for Stage 1. Raise it if Stage 1's VRAM usage in --vram_report is well below your "
+             "other stages; lower it if it climbs sharply or OOMs.")
     parser.add_argument(
         '--memfof_no_shared_fnet', action='store_true',
-        help="Disable computing each unique frame's feature map once (batched across all frames in "
-             "the chunk) and reusing it across every window that needs it -- on by default. This is "
-             "different from --memfof_fmap_cache above: it stays fully batched throughout (no "
-             "batch=1 step), so it doesn't have that option's GPU-underutilization problem. "
-             "Validated bit-exact against the non-shared path (MemFOF's own default per-window "
-             "computation) across many test configurations, and measured ~19%% faster with no VRAM "
-             "downside. The one real caveat: this reaches into MemFOF's internal submodules and "
-             "hand-replicates its forward-pass orchestration rather than calling its public API, so "
-             "a future MemFOF version could silently break it -- pass this flag to fall back to the "
-             "safe, officially-supported path if you ever suspect that's happened.")
+        help="Disable computing each unique frame's feature map once and reusing it across every "
+             "window that needs it (on by default; bit-exact, ~19%% faster, no VRAM downside). "
+             "This reaches into MemFOF's internal submodules rather than its public API, so a "
+             "future MemFOF version could break it -- use this flag to fall back to the safe, "
+             "officially-supported path if that happens.")
     parser.add_argument(
         '--mode', default='video_inpainting', choices=['video_inpainting', 'video_outpainting'], help="Modes: video_inpainting / video_outpainting")
     parser.add_argument(
@@ -451,29 +476,22 @@ if __name__ == '__main__':
     parser.add_argument(
         '--save_frames', action='store_true', help='Save output frames. Default: False')
     parser.add_argument(
-        '--fp16', action='store_true', help='Use fp16 (half precision) during inference. Default: fp32 (single precision).')
+        '--no-fp16', dest='fp16', action='store_false', default=True,
+        help='Disable fp16 (half precision) and run in fp32 (single precision) instead. '
+             'fp16 is on by default.')
     parser.add_argument(
         '--encoder_chunk_size', type=int, default=10,
         help="Number of frames to run through ProPainter's per-frame-independent components "
              "(encoder, SoftSplit/SoftComp -- the single largest transient tensors in the model, "
              "since each token's raw unfolded form is ~12x larger than its embedded form -- and "
-             "the decoder) at a time, within a single transformer-stage window. None of these mix "
-             "information across frames, so this is a pure memory/scheduling optimization with "
-             "bit-exact output -- unlike --neighbor_length below, it does not trade any quality "
-             "for memory. Lower this first if you're VRAM-constrained. Set to a large number "
-             "(e.g. 9999) to disable and process the whole window in one shot (the original "
-             "behavior).")
-    parser.add_argument(
-        '--defrag_threshold_mb', type=int, default=None,
-        help="If set, after each of the transformer's 8 sequential layers, check whether PyTorch's "
-             "caching allocator is holding more than this many MB 'reserved' (visible in nvidia-smi) "
-             "beyond what's actually 'allocated' -- a sign of fragmentation from the repeated "
-             "alloc/free cycles inside windowed attention, which the pipeline's normal between-stage "
-             "cache-clearing can't reach since it never runs mid-model. When exceeded, proactively "
-             "calls torch.cuda.empty_cache(). Off (None) by default: cheap to check, but "
-             "empty_cache() itself is a synchronizing call with a real speed cost, so this trades "
-             "some speed for a lower true peak -- worth trying (e.g. 1000) if nvidia-smi/task "
-             "manager shows meaningfully more usage than --vram_report's allocator numbers.")
+             "the decoder) at a time, within a single transformer-stage window. Also reused for "
+             "Stage 2's flow-completion decoder (decoder2/decoder1/upsample), which has the exact "
+             "same zero-cross-frame-mixing property once its features are reshaped to a per-frame "
+             "batch. None of these mix information across frames, so this is a pure memory/"
+             "scheduling optimization with bit-exact output -- unlike --neighbor_length below, it "
+             "does not trade any quality for memory. Lower this first if you're VRAM-constrained. "
+             "Set to a large number (e.g. 9999) to disable and process the whole window in one "
+             "shot (the original behavior).")
     parser.add_argument(
         '--auto_high_res_settings', action='store_true',
         help="If set, automatically caps --neighbor_length downward at high resolutions to control "
@@ -504,7 +522,8 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    vram_stats = {}          # torch allocator peak per stage (always available on CUDA)
+    vram_stats = {}          # PyTorch allocator peak (tensors only) per stage
+    reserved_vram_stats = {} # PyTorch caching-allocator pool peak (tensors + its own idle/cached blocks) per stage
     true_vram_stats = {}     # true device-memory peak per stage, via pynvml (optional)
     time_stats = {}          # wall-clock seconds per stage
     gpu_poller = _GpuTruePeakPoller(device, enabled=args.vram_report)
@@ -542,14 +561,17 @@ if __name__ == '__main__':
         time_stats[label] = elapsed
         peak = _vram_peak_mb(device)
         vram_stats[label] = peak
+        reserved_peak = _vram_reserved_peak_mb(device)
+        if reserved_peak is not None:
+            reserved_vram_stats[label] = reserved_peak
         true_peak = gpu_poller.peak_mb()
         if true_peak is not None:
             true_vram_stats[label] = true_peak
         if peak is not None:
             if true_peak is not None:
-                print(f'[VRAM] {label:35s} allocator {peak:9.1f} MB   true (nvidia-smi) {true_peak:9.1f} MB   time {elapsed:7.1f}s')
+                print(f'[VRAM] {label:35s} allocator {peak:9.1f} MB   reserved {reserved_peak:9.1f} MB   true (nvidia-smi) {true_peak:9.1f} MB   time {elapsed:7.1f}s')
             else:
-                print(f'[VRAM] {label:35s} peak {peak:9.1f} MB   time {elapsed:7.1f}s')
+                print(f'[VRAM] {label:35s} peak {peak:9.1f} MB   reserved {reserved_peak:9.1f} MB   time {elapsed:7.1f}s')
         else:
             print(f'[VRAM] {label:35s} N/A (running on CPU)   time {elapsed:7.1f}s')
 
@@ -570,9 +592,10 @@ if __name__ == '__main__':
         time_stats['Stage 0: CUDA context init'] = ctx_elapsed
         if ctx_reserved is not None:
             vram_stats['Stage 0: CUDA context init'] = ctx_reserved
+            reserved_vram_stats['Stage 0: CUDA context init'] = ctx_reserved
             if ctx_peak is not None:
                 true_vram_stats['Stage 0: CUDA context init'] = ctx_peak
-                print(f'[VRAM] {"Stage 0: CUDA context init":35s} allocator {ctx_reserved:9.1f} MB   true (nvidia-smi) {ctx_peak:9.1f} MB   time {ctx_elapsed:7.1f}s')
+                print(f'[VRAM] {"Stage 0: CUDA context init":35s} allocator {ctx_reserved:9.1f} MB   reserved {ctx_reserved:9.1f} MB   true (nvidia-smi) {ctx_peak:9.1f} MB   time {ctx_elapsed:7.1f}s')
             else:
                 print(f'[VRAM] {"Stage 0: CUDA context init":35s} reserved {ctx_reserved:9.1f} MB   time {ctx_elapsed:7.1f}s')
         else:
@@ -586,14 +609,16 @@ if __name__ == '__main__':
         use_half = False
 
     frames, fps, size, video_name = read_frame_from_videos(args.video)
-    # Keep a reference to the frames at their true native resolution --
-    # `frames` gets reassigned to a (possibly downscaled) copy below by
-    # resize_frames(), but PIL's .resize() returns a new image rather than
-    # mutating in place, so this list of the original objects stays intact
-    # and untouched by any processing-resolution downscaling. Used later
-    # for --native_resolution_composite.
-    frames_native_pil = frames
-    native_size = frames_native_pil[0].size
+    # Keep a reference to the frames at their true native resolution, but
+    # only when --native_resolution_composite might use them (the only place
+    # frames_native_pil is read) -- otherwise this would hold a second
+    # full-resolution copy of the whole video for no purpose. `frames` gets
+    # reassigned to a (possibly downscaled) copy below by resize_frames(),
+    # but PIL's .resize() returns a new image rather than mutating in place,
+    # so this list of the original objects (when kept) stays untouched by
+    # any processing-resolution downscaling.
+    frames_native_pil = frames if args.native_resolution_composite else None
+    native_size = frames[0].size
 
     if not args.width == -1 and not args.height == -1:
         size = (args.width, args.height)
@@ -641,8 +666,11 @@ if __name__ == '__main__':
                   f'(without --auto_high_res_settings) to override.')
             args.neighbor_length = neighbor_cap
     
-    # for saving the masked frames or video
-    masked_frame_for_save = []
+    # For saving the masked-input preview video. Streamed straight to disk as
+    # each frame is computed rather than accumulated in RAM, since all its
+    # inputs (frames, masks_dilated) are already available here, well before
+    # any GPU stage starts.
+    masked_in_writer = imageio.get_writer(os.path.join(save_root, 'masked_in.mp4'), fps=fps, quality=7)
     for i in range(len(frames)):
         mask_ = np.expand_dims(np.array(masks_dilated[i]),2).repeat(3, axis=2)/255.
         img = np.array(frames[i])
@@ -652,25 +680,30 @@ if __name__ == '__main__':
         # alpha = 1.0
         fuse_img = (1-alpha)*img + alpha*green
         fuse_img = mask_ * fuse_img + (1-mask_)*img
-        masked_frame_for_save.append(fuse_img.astype(np.uint8))
+        fuse_img = cv2.resize(fuse_img.astype(np.uint8), out_size)
+        masked_in_writer.append_data(fuse_img)
+    masked_in_writer.close()
 
-    frames_inp = [np.array(f).astype(np.uint8) for f in frames]
-    frames = to_tensors()(frames).unsqueeze(0) * 2 - 1    
-    flow_masks = to_tensors()(flow_masks).unsqueeze(0)
-    masks_dilated = to_tensors()(masks_dilated).unsqueeze(0)
+    # Stored as uint8 (frames: raw [0,255]; masks: collapsed to {0,1}) rather
+    # than eagerly converting the whole video to float32 here -- see
+    # pil_list_to_uint8_tensor's docstring. Each chunk gets converted to
+    # float only once it's already on the active device, at each call site
+    # below.
+    frames = pil_list_to_uint8_tensor(frames)                          # (1, T, 3, H, W) uint8, [0,255]
+    frames_inp = frames[0].permute(0, 2, 3, 1).numpy()                 # (T, H, W, 3) uint8 -- same data, no separate PIL pass
+    flow_masks = pil_list_to_uint8_tensor(flow_masks, binarize=True)   # (1, T, 1, H, W) uint8, {0,1}
+    masks_dilated = pil_list_to_uint8_tensor(masks_dilated, binarize=True)  # (1, T, 1, H, W) uint8, {0,1}
 
     # ---- VRAM strategy ----
-    # `frames`, `flow_masks` and `masks_dilated` hold the ENTIRE video and are
-    # kept resident on the CPU/host RAM for the whole run, instead of being
-    # moved to the GPU once up front. Each stage below only transfers the
-    # sub-chunk it is currently working on to `device`, and copies results
+    # `frames`, `flow_masks` and `masks_dilated` hold the entire video and
+    # stay resident on CPU/host RAM for the whole run. Only the sub-chunk
+    # currently being processed is moved to `device`, with results copied
     # back to the CPU immediately afterwards (with explicit `del` +
-    # `torch.cuda.empty_cache()`). This bounds peak VRAM to roughly
-    # (one model's weights + one chunk's activations) rather than
-    # (all three models + the full video), which is what made long videos
-    # OOM before. The three models (RAFT, flow-completion, ProPainter) are
-    # also now constructed on-demand and freed as soon as their stage is
-    # done, instead of all being resident on the GPU simultaneously.
+    # `torch.cuda.empty_cache()`). This bounds peak VRAM to roughly one
+    # model's weights plus one chunk's activations. The three models
+    # (RAFT/MemFOF, flow-completion, ProPainter) are constructed on-demand
+    # and freed as soon as their stage finishes, rather than all being
+    # resident on the GPU simultaneously.
     video_length = frames.size(1)
     print(f'\nProcessing: {video_name} [{video_length} frames]...')
 
@@ -681,40 +714,29 @@ if __name__ == '__main__':
         # MemFOF downloads its own pretrained checkpoint from HuggingFace Hub
         # on first use (via MEMFOF.from_pretrained inside MEMFOF_bi).
         use_shared_fnet = not args.memfof_no_shared_fnet
-        if args.memfof_fmap_cache and use_shared_fnet:
-            # These two are mutually exclusive by construction (shared_fnet
-            # needs a full batch of unique frames; fmap_cache needs strictly
-            # sequential batch=1 processing) and MEMFOF_bi's dispatch would
-            # otherwise silently prefer shared_fnet, quietly ignoring the
-            # user's explicit request for fmap_cache. Make that visible
-            # instead of silent.
-            print('[flow_model] --memfof_fmap_cache was requested; disabling --memfof_no_shared_fnet\'s '
-                  'default counterpart (shared_fnet) since the two are mutually exclusive.')
-            use_shared_fnet = False
-        fix_raft = MEMFOF_bi(args.memfof_model, device, use_fmap_cache=args.memfof_fmap_cache,
-                              use_shared_fnet=use_shared_fnet)
-        # MemFOF's own paper/repo default is 8 refinement iterations (vs
-        # RAFT's 20); if the user left --raft_iter at its RAFT-oriented
-        # default, use MemFOF's own default instead rather than over-refining.
-        flow_iters = 8 if args.raft_iter == 20 else args.raft_iter
+        fix_raft = MEMFOF_bi(args.memfof_model, device, use_shared_fnet=use_shared_fnet)
+        # 6 refinement iterations is well-supported for MemFOF (4->6 gives a
+        # real improvement, 6->8 is negligible); used unless --raft_iter is
+        # set explicitly (i.e. left at RAFT's default of 20).
+        flow_iters = 6 if args.raft_iter == 20 else args.raft_iter
     else:
         ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'raft-things.pth'), 
                                         model_dir='weights', progress=True, file_name=None)
         fix_raft = RAFT_bi(ckpt_path, device)
         flow_iters = args.raft_iter
 
-    with torch.inference_mode():
+    # RAFT's correlation-volume computation is numerically unstable in fp16,
+    # so it always runs in fp32 regardless of fp16 being on. MemFOF doesn't
+    # share that instability and benefits from autocast like every other
+    # stage, so it's the only one of the two gated by use_half.
+    stage1_autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16,
+                                          enabled=(use_half and args.flow_model == 'memfof'))
+
+    with torch.inference_mode(), stage1_autocast_ctx:
         if args.flow_model == 'memfof':
-            # MemFOF does not have RAFT's all-pairs correlation volume (the
-            # O((H*W)^2) blowup that forces RAFT's short_clip_len this low --
-            # see corr_levels/corr_radius above, a small local correlation
-            # instead), so reusing RAFT's resolution-based thresholds here
-            # just forces far more, far smaller chunks than MemFOF actually
-            # needs memory-wise. Measured: Stage 1's own VRAM (with the
-            # RAFT-derived chunk size) came in well under Stage 2/3b's, i.e.
-            # there was real headroom being left unused while paying full
-            # per-chunk overhead (Python dispatch, cuDNN algorithm
-            # reselection, CPU<->GPU transfer) far more often than needed.
+            # MemFOF doesn't have RAFT's all-pairs correlation volume (the
+            # O((H*W)^2) blowup that forces RAFT's short_clip_len this low),
+            # so it uses its own, less conservative chunk size instead.
             short_clip_len = args.memfof_chunk_len
         elif frames.size(-1) <= 640: 
             short_clip_len = 12
@@ -725,15 +747,19 @@ if __name__ == '__main__':
         else:
             short_clip_len = 2
         
-        # use fp32 for RAFT
         if video_length > short_clip_len:
             gt_flows_f_list, gt_flows_b_list = [], []
-            for f in range(0, video_length, short_clip_len):
+            for f in tqdm(range(0, video_length, short_clip_len), desc=f'Stage 1: optical flow ({args.flow_model})'):
                 end_f = min(video_length, f + short_clip_len)
                 if f == 0:
                     chunk = frames[:, f:end_f].to(device)
                 else:
                     chunk = frames[:, f-1:end_f].to(device)
+                # frames is stored as uint8 [0,255] CPU-side (see
+                # pil_list_to_uint8_tensor); both RAFT_bi and MEMFOF_bi expect
+                # [-1,1] float input, so convert only this chunk, only once
+                # it's already on the active device.
+                chunk = chunk.float() / 255 * 2 - 1
                 flows_f, flows_b = fix_raft(chunk, iters=flow_iters)
 
                 gt_flows_f_list.append(flows_f.cpu())
@@ -746,9 +772,10 @@ if __name__ == '__main__':
             gt_flows_bi = (gt_flows_f, gt_flows_b)
             del gt_flows_f_list, gt_flows_b_list
         else:
-            flows_f, flows_b = fix_raft(frames.to(device), iters=flow_iters)
+            chunk = frames.to(device).float() / 255 * 2 - 1
+            flows_f, flows_b = fix_raft(chunk, iters=flow_iters)
             gt_flows_bi = (flows_f.cpu(), flows_b.cpu())
-            del flows_f, flows_b
+            del chunk, flows_f, flows_b
             torch.cuda.empty_cache()
 
     del fix_raft
@@ -756,24 +783,22 @@ if __name__ == '__main__':
     _report_stage(f'Stage 1: optical flow ({args.flow_model})')
     _stage_reset()
 
-    if use_half:
-        frames, flow_masks, masks_dilated = frames.half(), flow_masks.half(), masks_dilated.half()
-        gt_flows_bi = (gt_flows_bi[0].half(), gt_flows_bi[1].half())
-
     ##############################################
     # ---- stage 2: flow completion ----
     ##############################################
     ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'recurrent_flow_completion.pth'), 
                                     model_dir='weights', progress=True, file_name=None)
-    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path)
+    fix_flow_complete = RecurrentFlowCompleteNet(ckpt_path, encoder_chunk_size=args.encoder_chunk_size)
     for p in fix_flow_complete.parameters():
         p.requires_grad = False
     fix_flow_complete.to(device)
     fix_flow_complete.eval()
-    if use_half:
-        fix_flow_complete = fix_flow_complete.half()
+    # Weights stay fp32; autocast below handles the fp16 compute, so
+    # precision-sensitive ops inside this net aren't forced into fp16 along
+    # with everything else.
+    stage2_autocast_ctx = torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_half)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), stage2_autocast_ctx:
         flow_length = gt_flows_bi[0].size(1)
         if flow_length > args.flow_completion_chunk_size:
             pred_flows_f, pred_flows_b = [], []
@@ -785,7 +810,10 @@ if __name__ == '__main__':
                 pad_len_e = e_f - min(flow_length, f + args.flow_completion_chunk_size)
 
                 flows_chunk = (gt_flows_bi[0][:, s_f:e_f].to(device), gt_flows_bi[1][:, s_f:e_f].to(device))
-                masks_chunk = flow_masks[:, s_f:e_f+1].to(device)
+                # masks_dilated/flow_masks are stored as uint8 {0,1} (see
+                # pil_list_to_uint8_tensor), so this is just a plain cast, no
+                # division needed.
+                masks_chunk = flow_masks[:, s_f:e_f+1].to(device).float()
 
                 pred_flows_bi_sub, _ = fix_flow_complete.forward_bidirect_flow(flows_chunk, masks_chunk)
                 pred_flows_bi_sub = fix_flow_complete.combine_flow(flows_chunk, pred_flows_bi_sub, masks_chunk)
@@ -801,7 +829,7 @@ if __name__ == '__main__':
             del pred_flows_f, pred_flows_b
         else:
             flows_all = to_device_tuple(gt_flows_bi, device)
-            masks_all = flow_masks.to(device)
+            masks_all = flow_masks.to(device).float()
             pred_flows_bi, _ = fix_flow_complete.forward_bidirect_flow(flows_all, masks_all)
             pred_flows_bi = fix_flow_complete.combine_flow(flows_all, pred_flows_bi, masks_all)
             pred_flows_bi = (pred_flows_bi[0].cpu(), pred_flows_bi[1].cpu())
@@ -818,16 +846,28 @@ if __name__ == '__main__':
     ##############################################
     ckpt_path = load_file_from_url(url=os.path.join(pretrain_model_url, 'ProPainter.pth'), 
                                     model_dir='weights', progress=True, file_name=None)
-    model = InpaintGenerator(model_path=ckpt_path, encoder_chunk_size=args.encoder_chunk_size,
-                              defrag_threshold_mb=args.defrag_threshold_mb).to(device)
+    model = InpaintGenerator(model_path=ckpt_path, encoder_chunk_size=args.encoder_chunk_size).to(device)
     model.eval()
-    if use_half:
-        model = model.half()
+    # Model weights stay fp32; autocast below runs the conv/linear/matmul-heavy
+    # work (encoder, decoder, SoftSplit/SoftComp, deformable alignment,
+    # attention matmuls) in fp16 for speed/VRAM, but keeps precision-sensitive
+    # reductions -- LayerNorm and softmax inside SparseWindowAttention -- in
+    # fp32, where they're numerically safer. With --no-fp16, autocast is
+    # disabled and everything runs in plain fp32.
+    autocast_ctx = torch.autocast(device_type='cuda' if device.type == 'cuda' else 'cpu',
+                                   dtype=torch.float16, enabled=use_half)
 
-    with torch.inference_mode():
+    with torch.inference_mode(), autocast_ctx:
         # ---- image propagation ----
-        masked_frames = frames * (1 - masks_dilated)
-        subvideo_length_img_prop = min(100, args.subvideo_length) # ensure a minimum of 100 frames for image propagation
+        # frames/masks_dilated are stored as uint8 CPU-side (see
+        # pil_list_to_uint8_tensor); each branch below converts and combines
+        # only the chunk it actually needs, right before use.
+        # NOTE (see --img_propagation_chunk_size help): image propagation is a
+        # genuinely recurrent bidirectional pass, so -- like flow completion above --
+        # this chunk size is a real quality/memory tradeoff, not a free bit-exact
+        # scheduling choice. The pad_len=10 overlap below softens but doesn't
+        # eliminate the context loss at each chunk boundary.
+        subvideo_length_img_prop = args.img_propagation_chunk_size
         if video_length > subvideo_length_img_prop:
             updated_frames, updated_masks = [], []
             pad_len = 10
@@ -839,37 +879,47 @@ if __name__ == '__main__':
 
                 b, t, _, _, _ = masks_dilated[:, s_f:e_f].size()
                 flows_chunk = (pred_flows_bi[0][:, s_f:e_f-1].to(device), pred_flows_bi[1][:, s_f:e_f-1].to(device))
-                masked_chunk = masked_frames[:, s_f:e_f].to(device)
-                masks_chunk = masks_dilated[:, s_f:e_f].to(device)
+                # Converted once here (small: just this chunk) and reused for
+                # both the GPU propagation call below and the CPU blend after,
+                # instead of converting twice.
+                frames_chunk = frames[:, s_f:e_f].float() / 255 * 2 - 1
+                masks_chunk_cpu = masks_dilated[:, s_f:e_f].float()
+                masked_chunk = (frames_chunk * (1 - masks_chunk_cpu)).to(device)
+                masks_chunk = masks_chunk_cpu.to(device)
 
                 prop_imgs_sub, updated_local_masks_sub = model.img_propagation(masked_chunk, flows_chunk, masks_chunk, 'nearest')
                 prop_imgs_sub = prop_imgs_sub.cpu()
                 updated_local_masks_sub = updated_local_masks_sub.cpu()
 
-                updated_frames_sub = frames[:, s_f:e_f] * (1 - masks_dilated[:, s_f:e_f]) + \
-                                    prop_imgs_sub.view(b, t, 3, h, w) * masks_dilated[:, s_f:e_f]
+                updated_frames_sub = frames_chunk * (1 - masks_chunk_cpu) + \
+                                    prop_imgs_sub.view(b, t, 3, h, w) * masks_chunk_cpu
                 updated_masks_sub = updated_local_masks_sub.view(b, t, 1, h, w)
                 
                 updated_frames.append(updated_frames_sub[:, pad_len_s:e_f-s_f-pad_len_e])
                 updated_masks.append(updated_masks_sub[:, pad_len_s:e_f-s_f-pad_len_e])
 
-                del flows_chunk, masked_chunk, masks_chunk, prop_imgs_sub, updated_local_masks_sub
+                del flows_chunk, frames_chunk, masks_chunk_cpu, masked_chunk, masks_chunk, prop_imgs_sub, updated_local_masks_sub
                 torch.cuda.empty_cache()
                 
             updated_frames = torch.cat(updated_frames, dim=1)
             updated_masks = torch.cat(updated_masks, dim=1)
         else:
+            # This branch only ever runs when video_length <= img_propagation_chunk_size
+            # (<=80 frames by default), so converting the whole thing to float here
+            # is already bounded to a small clip, not the full multi-minute video.
             b, t, _, _, _ = masks_dilated.size()
             flows_all = to_device_tuple(pred_flows_bi, device)
-            masked_all = masked_frames.to(device)
-            masks_all = masks_dilated.to(device)
+            frames_f = frames.float() / 255 * 2 - 1
+            masks_f = masks_dilated.float()
+            masked_all = (frames_f * (1 - masks_f)).to(device)
+            masks_all = masks_f.to(device)
             prop_imgs, updated_local_masks = model.img_propagation(masked_all, flows_all, masks_all, 'nearest')
-            updated_frames = frames * (1 - masks_dilated) + prop_imgs.cpu().view(b, t, 3, h, w) * masks_dilated
+            updated_frames = frames_f * (1 - masks_f) + prop_imgs.cpu().view(b, t, 3, h, w) * masks_f
             updated_masks = updated_local_masks.cpu().view(b, t, 1, h, w)
-            del flows_all, masked_all, masks_all, prop_imgs, updated_local_masks
+            del flows_all, frames_f, masks_f, masked_all, masks_all, prop_imgs, updated_local_masks
             torch.cuda.empty_cache()
 
-        del masked_frames, frames
+        del frames
         torch.cuda.empty_cache()
         _report_stage('Stage 3a: ProPainter image propagation')
         _stage_reset()
@@ -878,20 +928,23 @@ if __name__ == '__main__':
         comp_frames = [None] * video_length
 
         neighbor_stride = args.neighbor_length // 2
-        if video_length > args.subvideo_length:
-            ref_num = args.subvideo_length // args.ref_stride
-        else:
-            ref_num = -1
+        # --max_ref_frames controls how many global reference frames are
+        # sampled on long videos; when left unset, falls back to
+        # --subvideo_length // --ref_stride.
+        max_ref_frames = (args.max_ref_frames if args.max_ref_frames is not None
+                          else args.subvideo_length // args.ref_stride)
+        ref_num = max_ref_frames if video_length > args.subvideo_length else -1
         
         # ---- feature propagation + transformer ----
-        for f in tqdm(range(0, video_length, neighbor_stride)):
+        for f in tqdm(range(0, video_length, neighbor_stride), desc='Stage 3b: transformer'):
             neighbor_ids = [
                 i for i in range(max(0, f - neighbor_stride),
                                     min(video_length, f + neighbor_stride + 1))
             ]
             ref_ids = get_ref_index(f, neighbor_ids, video_length, args.ref_stride, ref_num)
             selected_imgs = updated_frames[:, neighbor_ids + ref_ids, :, :, :].to(device)
-            selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :].to(device)
+            # masks_dilated is stored as uint8 {0,1}; plain cast, no division.
+            selected_masks = masks_dilated[:, neighbor_ids + ref_ids, :, :, :].to(device).float()
             selected_update_masks = updated_masks[:, neighbor_ids + ref_ids, :, :, :].to(device)
             selected_pred_flows_bi = (pred_flows_bi[0][:, neighbor_ids[:-1], :, :, :].to(device),
                                        pred_flows_bi[1][:, neighbor_ids[:-1], :, :, :].to(device))
@@ -980,40 +1033,41 @@ if __name__ == '__main__':
 
     # if args.mode == 'video_outpainting':
     #     comp_frames = [i[10:-10,10:-10] for i in comp_frames]
-    #     masked_frame_for_save = [i[10:-10,10:-10] for i in masked_frame_for_save]
-    
-    # save videos frame
-    masked_frame_for_save = [cv2.resize(f, out_size) for f in masked_frame_for_save]
+
+    # save video (masked_in.mp4 is streamed out separately, above)
     comp_frames = [cv2.resize(f, out_size) for f in comp_frames]
-    imageio.mimwrite(os.path.join(save_root, 'masked_in.mp4'), masked_frame_for_save, fps=fps, quality=7)
     imageio.mimwrite(os.path.join(save_root, 'inpaint_out.mp4'), comp_frames, fps=fps, quality=7)
     
     print(f'\nAll results are saved in {save_root}')
 
     if args.vram_report:
-        print('\n' + '=' * 90)
+        print('\n' + '=' * 110)
         print('VRAM & timing summary')
-        print('=' * 90)
+        print('=' * 110)
         have_true = len(true_vram_stats) > 0
-        print(f'  {"stage":35s} {"allocator (MB)":>16s} {"true / nvidia-smi (MB)":>24s} {"time (s)":>10s}')
+        print(f'  {"stage":35s} {"allocator (MB)":>16s} {"reserved (MB)":>16s} {"true / nvidia-smi (MB)":>24s} {"time (s)":>10s}')
         for label, elapsed in time_stats.items():
             peak = vram_stats.get(label)
             peak_str = f'{peak:16.1f}' if peak is not None else f'{"n/a":>16s}'
+            reserved_str = f'{reserved_vram_stats[label]:16.1f}' if label in reserved_vram_stats else f'{"n/a":>16s}'
             true_str = f'{true_vram_stats[label]:24.1f}' if label in true_vram_stats else f'{"n/a":>24s}'
-            print(f'  {label:35s} {peak_str} {true_str} {elapsed:10.1f}')
-        print('-' * 90)
+            print(f'  {label:35s} {peak_str} {reserved_str} {true_str} {elapsed:10.1f}')
+        print('-' * 110)
         total_time = sum(time_stats.values())
-        print(f'  {"Total time":35s} {"":16s} {"":24s} {total_time:10.1f}')
+        print(f'  {"Total time":35s} {"":16s} {"":16s} {"":24s} {total_time:10.1f}')
         if vram_stats and any(v is not None for v in vram_stats.values()):
             overall_peak = max(v for v in vram_stats.values() if v is not None)
             print(f'  {"Overall peak, allocator (largest single stage)":35s} {overall_peak:16.1f}')
+            if reserved_vram_stats:
+                overall_reserved_peak = max(reserved_vram_stats.values())
+                print(f'  {"Overall peak, reserved (PyTorch pool)":35s} {overall_reserved_peak:16.1f}')
             if have_true:
                 overall_true_peak = max(true_vram_stats.values())
                 print(f'  {"Overall peak, true GPU memory":35s} {overall_true_peak:16.1f} MB  <- use this one for '
                       f'"will it fit on my card"')
         else:
             print('  (No CUDA device in this run -- memory columns are n/a, timing above is still real.)')
-        print('=' * 90)
+        print('=' * 110)
 
     gpu_poller.stop()
     torch.cuda.empty_cache()

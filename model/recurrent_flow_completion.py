@@ -201,7 +201,7 @@ class EdgeDetection(nn.Module):
 
 
 class RecurrentFlowCompleteNet(nn.Module):
-    def __init__(self, model_path=None):
+    def __init__(self, model_path=None, encoder_chunk_size=None):
         super().__init__()
         self.downsample = nn.Sequential(
                         nn.Conv3d(3, 32, kernel_size=(1, 5, 5), stride=(1, 2, 2), 
@@ -268,6 +268,19 @@ class RecurrentFlowCompleteNet(nn.Module):
             ckpt = torch.load(model_path, map_location='cpu')
             self.load_state_dict(ckpt, strict=True)
 
+        # decoder2/decoder1/upsample below are plain per-frame 2D convs with
+        # zero cross-frame mixing once feat_prop/feat_e1 are reshaped to
+        # (b*t, c, h, w) -- same "no cross-item mixing" situation as
+        # --encoder_chunk_size already exploits for the ProPainter
+        # transformer's own encoder/decoder, just never applied here. Chunking
+        # over that merged batch dimension is therefore provably bit-exact
+        # regardless of chunk size; only used at inference (this is None
+        # during training, matching the original unchunked behavior exactly,
+        # since chunking during training saves nothing anyway -- autograd
+        # keeps every chunk's activations alive for the backward pass
+        # regardless).
+        self.encoder_chunk_size = encoder_chunk_size
+
 
     def forward(self, masked_flows, masks):
         # masked_flows: b t-1 2 h w
@@ -284,20 +297,33 @@ class RecurrentFlowCompleteNet(nn.Module):
         feat_e2 = self.encoder2(feat_e1) # b c t h w
         feat_mid = self.mid_dilation(feat_e2) # b c t h w
         feat_mid = feat_mid.permute(0,2,1,3,4) # b t c h w
+        del x, feat_e2
 
         feat_prop = self.feat_prop_module(feat_mid)
+        del feat_mid
         feat_prop = feat_prop.view(-1, 128, h//8, w//8) # b*t c h w
 
         _, c, _, h_f, w_f = feat_e1.shape
         feat_e1 = feat_e1.permute(0,2,1,3,4).contiguous().view(-1, c, h_f, w_f) # b*t c h w
-        feat_d2 = self.decoder2(feat_prop) + feat_e1
 
-        _, c, _, h_f, w_f = x.shape
-        x = x.permute(0,2,1,3,4).contiguous().view(-1, c, h_f, w_f) # b*t c h w
+        # decoder2/decoder1/upsample have no cross-frame dependency at this
+        # point (plain 2D convs over the merged b*t batch dim), so -- like
+        # --encoder_chunk_size for the ProPainter transformer -- this can be
+        # scheduled in smaller pieces with no effect on the result. Chunk
+        # size of None (always true during training) processes everything
+        # in one call, identical to the original behavior.
+        n_bt = feat_prop.shape[0]
+        chunk = self.encoder_chunk_size if self.encoder_chunk_size is not None else n_bt
+        flow_chunks = []
+        for s in range(0, n_bt, chunk):
+            e = min(n_bt, s + chunk)
+            feat_d2 = self.decoder2(feat_prop[s:e]) + feat_e1[s:e]
+            feat_d1 = self.decoder1(feat_d2)
+            flow_chunks.append(self.upsample(feat_d1))
+            del feat_d2, feat_d1
+        flow = torch.cat(flow_chunks, dim=0) if len(flow_chunks) > 1 else flow_chunks[0]
+        del flow_chunks, feat_prop, feat_e1
 
-        feat_d1 = self.decoder1(feat_d2)
-
-        flow = self.upsample(feat_d1)
         if self.training:
             edge = self.edgeDetector(flow)
             edge = edge.view(b, t, 1, h, w)

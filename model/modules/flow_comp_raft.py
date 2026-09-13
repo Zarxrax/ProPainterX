@@ -7,7 +7,7 @@ from RAFT import RAFT
 from model.modules.flow_loss_utils import flow_warp, ternary_loss2
 
 
-def initialize_RAFT(model_path='weights/raft-things.pth', device='cuda'):
+def initialize_RAFT(model_path='weights/raft-things.pth', device=None):
     """Initializes the RAFT model.
     """
     args = argparse.ArgumentParser()
@@ -19,14 +19,20 @@ def initialize_RAFT(model_path='weights/raft-things.pth', device='cuda'):
     model.load_state_dict(torch.load(args.raft_model, map_location='cpu'))
     model = model.module
 
-    model.to(device)
+    # No hardcoded fallback device: torch.load(..., map_location='cpu') above
+    # already leaves the model on CPU, which is a safe default that works
+    # anywhere. Only move it if the caller actually asked for somewhere else,
+    # so this doesn't blow up with no CUDA device just because none was
+    # explicitly requested.
+    if device is not None:
+        model.to(device)
 
     return model
 
 
 class RAFT_bi(nn.Module):
     """Flow completion loss"""
-    def __init__(self, model_path='weights/raft-things.pth', device='cuda'):
+    def __init__(self, model_path='weights/raft-things.pth', device=None):
         super().__init__()
         self.fix_raft = initialize_RAFT(model_path, device=device)
 
